@@ -5,16 +5,18 @@ Secure Boot is a feature for ensuring only your code can run on the chip. Data l
 
 Secure Boot is separate from the :doc:`Flash Encryption <flash-encryption>` feature, and you can use secure boot without encrypting the flash contents. However we recommend using both features together for a secure environment.
 
-**IMPORTANT: Enabling secure boot limits your options for further updates of your ESP32. Make sure to read this document throughly and understand the implications of enabling secure boot.**
+.. important::
+
+    Enabling secure boot limits your options for further updates of your ESP32. Make sure to read this document throughly and understand the implications of enabling secure boot.
 
 Background
 ----------
 
 - Most data is stored in flash. Flash access does not need to be protected from physical access in order for secure boot to function, because critical data is stored (non-software-accessible) in Efuses internal to the chip.
 
-- Efuses are used to store the secure bootloader key (in efuse block 2), and also a single Efuse bit (ABS_DONE_0) is burned (written to 1) to permanently enable secure boot on the chip. For more details about efuse, see the (forthcoming) chapter in the Technical Reference Manual.
+- Efuses are used to store the secure bootloader key (in efuse BLOCK2), and also a single Efuse bit (ABS_DONE_0) is burned (written to 1) to permanently enable secure boot on the chip.  For more details about efuse, see Chapter 11 "eFuse Controller" in the Technical Referecnce Manual.
 
-- To understand the secure boot process, first familiarise yourself with the standard :doc:`ESP-IDF boot process <../general-notes>`.
+- To understand the secure boot process, first familiarise yourself with the standard :doc:`ESP-IDF boot process <../api-guides/general-notes>`.
 
 - Both stages of the boot process (initial software bootloader load, and subsequent partition & app loading) are verified by the secure boot process, in a "chain of trust" relationship.
 

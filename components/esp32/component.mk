@@ -2,8 +2,12 @@
 # Component Makefile
 #
 
+#ifdef IS_BOOTLOADER_BUILD
+CFLAGS += -DBOOTLOADER_BUILD
+#endif
+
 COMPONENT_SRCDIRS := . hwcrypto
-LIBS := core rtc rtc_clk rtc_pm
+LIBS := core rtc
 ifdef CONFIG_PHY_ENABLED # BT || WIFI
 LIBS += phy coexist
 endif
@@ -17,12 +21,19 @@ ifeq ("$(CONFIG_NEWLIB_NANO_FORMAT)","y")
 LINKER_SCRIPTS += esp32.rom.nanofmt.ld
 endif
 
-COMPONENT_ADD_LDFLAGS := -lesp32 \
-                         $(COMPONENT_PATH)/libhal.a \
+ifndef CONFIG_SPI_FLASH_ROM_DRIVER_PATCH
+LINKER_SCRIPTS += esp32.rom.spiflash.ld
+endif
+
+#ld_include_panic_highint_hdl is added as an undefined symbol because otherwise the 
+#linker will ignore panic_highint_hdl.S as it has no other files depending on any
+#symbols in it.
+COMPONENT_ADD_LDFLAGS += $(COMPONENT_PATH)/libhal.a \
                          -L$(COMPONENT_PATH)/lib \
                          $(addprefix -l,$(LIBS)) \
                          -L $(COMPONENT_PATH)/ld \
                          -T esp32_out.ld \
+                         -u ld_include_panic_highint_hdl \
                          $(addprefix -T ,$(LINKER_SCRIPTS))
 
 ALL_LIB_FILES := $(patsubst %,$(COMPONENT_PATH)/lib/lib%.a,$(LIBS))

@@ -152,6 +152,7 @@ tcp_send_fin(struct tcp_pcb *pcb)
       return ERR_OK;
     }
   }
+
   /* no data, no length, flags, copy=1, no optdata */
   return tcp_enqueue_flags(pcb, TCP_FIN);
 }
@@ -213,6 +214,7 @@ tcp_create_segment(struct tcp_pcb *pcb, struct pbuf *p, u8_t flags, u32_t seqno,
   TCPH_HDRLEN_FLAGS_SET(seg->tcphdr, (5 + optlen / 4), flags);
   /* wnd and chksum are set in tcp_output */
   seg->tcphdr->urgp = 0;
+
   return seg;
 }
 
@@ -1066,7 +1068,7 @@ tcp_output(struct tcp_pcb *pcb)
     seg->oversize_left = 0;
 #endif /* TCP_OVERSIZE_DBGCHECK */
     err = tcp_output_segment(seg, pcb);
-    if (err != ERR_OK) {
+    if ((err != ERR_OK) && (err != ERR_RTE)) {
       /* segment could not be sent, for whatever reason */
       pcb->flags |= TF_NAGLEMEMERR;
       return err;
@@ -1424,6 +1426,7 @@ tcp_rexmit(struct tcp_pcb *pcb)
   }
 #endif /* TCP_OVERSIZE */
 
+  ESP_STATS_TCP_PCB(pcb);
   ++pcb->nrtx;
 
   /* Don't take any rtt measurements after retransmitting. */

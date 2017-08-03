@@ -108,7 +108,7 @@ Where possible, we recommend using the partition write function ``esp_partition_
 
 The ``esp_spi_flash_write`` function will write data when the write_encrypted parameter is set to true. Otherwise, data will be written unencrypted.
 
-The ROM function ``SPI_Encrypt_Write`` will write encrypted data to flash, the ROM function ``SPIWrite`` will write unencrypted to flash. (these function are not supported in esp-idf apps).
+The ROM function ``esp_rom_spiflash_write_encrypted`` will write encrypted data to flash, the ROM function ``SPIWrite`` will write unencrypted to flash. (these function are not supported in esp-idf apps).
 
 The minimum write size for unencrypted data is 4 bytes (and the alignment is 4 bytes). Because data is encrypted in blocks, the minimum write size for encrypted data is 16 bytes (and the alignment is 16 bytes.)
 
@@ -282,7 +282,7 @@ Encrypted Partition Flag
 
 Some partitions are encrypted by default. Otherwise, it is possible to mark any partition as requiring encryption:
 
-In the :doc:`partition table </partition-tables>` description CSV files, there is a field for flags.
+In the :doc:`partition table <../api-guides/partition-tables>` description CSV files, there is a field for flags.
 
 Usually left blank, if you write "encrypted" in this field then the partition will be marked as encrypted in the partition table, and data written here will be treated as encrypted (same as an app partition)::
 
@@ -373,7 +373,7 @@ Flash Encryption Algorithm
 
 - AES algorithm is used inverted in flash encryption, so the flash encryption "encrypt" operation is AES decrypt and the "decrypt" operation is AES encrypt. This is for performance reasons and does not alter the effectiveness of the algorithm.
 
-- The main flash encryption key is stored in efuse (BLK2) and by default is protected from further writes or software readout.
+- The main flash encryption key is stored in efuse (BLOCK1) and by default is protected from further writes or software readout.
 
 - Each 32 byte block (two adjacent 16 byte AES blocks) is encrypted with a unique key. The key is derived from the main flash encryption key in efuse, XORed with the offset of this block in the flash (a "key tweak").
 

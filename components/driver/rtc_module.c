@@ -24,6 +24,16 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/xtensa_api.h"
 #include "freertos/semphr.h"
+#include "esp_intr_alloc.h"
+#include "sys/lock.h"
+#include "driver/rtc_cntl.h"
+
+#ifndef NDEBUG
+// Enable built-in checks in queue.h in debug builds
+#define INVARIANTS
+#endif
+#include "rom/queue.h"
+
 
 static const char *RTC_MODULE_TAG = "RTC_MODULE";
 
@@ -36,6 +46,8 @@ static const char *RTC_MODULE_TAG = "RTC_MODULE";
     ESP_LOGE(RTC_MODULE_TAG,"%s:%d\n",__FUNCTION__,__LINE__);\
     return ESP_FAIL;\
 }
+
+#define DAC_ERR_STR_CHANNEL_ERROR   "DAC channel error"
 
 portMUX_TYPE rtc_spinlock = portMUX_INITIALIZER_UNLOCKED;
 static xSemaphoreHandle rtc_touch_sem = NULL;
@@ -602,12 +614,27 @@ int adc1_get_voltage(adc1_channel_t channel)
     return adc_value;
 }
 
+void adc1_ulp_enable(void)
+{
+    portENTER_CRITICAL(&rtc_spinlock);
+    CLEAR_PERI_REG_MASK(SENS_SAR_MEAS_START1_REG, SENS_MEAS1_START_FORCE);
+    CLEAR_PERI_REG_MASK(SENS_SAR_MEAS_START1_REG, SENS_SAR1_EN_PAD_FORCE_M);
+    SET_PERI_REG_BITS(SENS_SAR_MEAS_WAIT2_REG, SENS_FORCE_XPD_AMP, 0x2, SENS_FORCE_XPD_AMP_S);
+    SET_PERI_REG_BITS(SENS_SAR_MEAS_WAIT2_REG, SENS_FORCE_XPD_SAR, 0, SENS_FORCE_XPD_SAR_S);
+    SET_PERI_REG_BITS(SENS_SAR_MEAS_CTRL_REG, 0xfff, 0x0, SENS_AMP_RST_FB_FSM_S);  //[11:8]:short ref ground, [7:4]:short ref, [3:0]:rst fb
+    SET_PERI_REG_BITS(SENS_SAR_MEAS_WAIT1_REG, SENS_SAR_AMP_WAIT1, 0x1, SENS_SAR_AMP_WAIT1_S);
+    SET_PERI_REG_BITS(SENS_SAR_MEAS_WAIT1_REG, SENS_SAR_AMP_WAIT2, 0x1, SENS_SAR_AMP_WAIT2_S);
+    SET_PERI_REG_BITS(SENS_SAR_MEAS_WAIT2_REG, SENS_SAR_AMP_WAIT3, 0x1, SENS_SAR_AMP_WAIT3_S);
+    portEXIT_CRITICAL(&rtc_spinlock);
+}
+
 /*---------------------------------------------------------------
                     DAC
 ---------------------------------------------------------------*/
 static esp_err_t dac_pad_get_io_num(dac_channel_t channel, gpio_num_t *gpio_num)
 {
-    RTC_MODULE_CHECK(channel < DAC_CHANNEL_MAX, "DAC Channel Err", ESP_ERR_INVALID_ARG);
+    RTC_MODULE_CHECK((channel >= DAC_CHANNEL_1) && (channel < DAC_CHANNEL_MAX), DAC_ERR_STR_CHANNEL_ERROR, ESP_ERR_INVALID_ARG);
+    RTC_MODULE_CHECK(gpio_num, "Param null", ESP_ERR_INVALID_ARG);
 
     switch (channel) {
     case DAC_CHANNEL_1:
@@ -625,7 +652,7 @@ static esp_err_t dac_pad_get_io_num(dac_channel_t channel, gpio_num_t *gpio_num)
 
 static esp_err_t dac_rtc_pad_init(dac_channel_t channel)
 {
-    RTC_MODULE_CHECK(channel < DAC_CHANNEL_MAX, "DAC Channel Err", ESP_ERR_INVALID_ARG);
+    RTC_MODULE_CHECK((channel >= DAC_CHANNEL_1) && (channel < DAC_CHANNEL_MAX), DAC_ERR_STR_CHANNEL_ERROR, ESP_ERR_INVALID_ARG);
     gpio_num_t gpio_num = 0;
     dac_pad_get_io_num(channel, &gpio_num);
     rtc_gpio_init(gpio_num);
@@ -637,26 +664,64 @@ static esp_err_t dac_rtc_pad_init(dac_channel_t channel)
     return ESP_OK;
 }
 
-static esp_err_t dac_out_enable(dac_channel_t channel)
+esp_err_t dac_output_enable(dac_channel_t channel)
 {
+    RTC_MODULE_CHECK((channel >= DAC_CHANNEL_1) && (channel < DAC_CHANNEL_MAX), DAC_ERR_STR_CHANNEL_ERROR, ESP_ERR_INVALID_ARG);
+    dac_rtc_pad_init(channel);
+    portENTER_CRITICAL(&rtc_spinlock);
     if (channel == DAC_CHANNEL_1) {
-        portENTER_CRITICAL(&rtc_spinlock);
         SET_PERI_REG_MASK(RTC_IO_PAD_DAC1_REG, RTC_IO_PDAC1_XPD_DAC | RTC_IO_PDAC1_DAC_XPD_FORCE);
-        portEXIT_CRITICAL(&rtc_spinlock);
     } else if (channel == DAC_CHANNEL_2) {
-        portENTER_CRITICAL(&rtc_spinlock);
         SET_PERI_REG_MASK(RTC_IO_PAD_DAC2_REG, RTC_IO_PDAC2_XPD_DAC | RTC_IO_PDAC2_DAC_XPD_FORCE);
-        portEXIT_CRITICAL(&rtc_spinlock);
-    } else {
-        return ESP_ERR_INVALID_ARG;
     }
+    portEXIT_CRITICAL(&rtc_spinlock);
+
+    return ESP_OK;
+}
+
+esp_err_t dac_output_disable(dac_channel_t channel)
+{
+    RTC_MODULE_CHECK((channel >= DAC_CHANNEL_1) && (channel < DAC_CHANNEL_MAX), DAC_ERR_STR_CHANNEL_ERROR, ESP_ERR_INVALID_ARG);
+    portENTER_CRITICAL(&rtc_spinlock);
+    if (channel == DAC_CHANNEL_1) {
+        CLEAR_PERI_REG_MASK(RTC_IO_PAD_DAC1_REG, RTC_IO_PDAC1_XPD_DAC | RTC_IO_PDAC1_DAC_XPD_FORCE);
+    } else if (channel == DAC_CHANNEL_2) {
+        CLEAR_PERI_REG_MASK(RTC_IO_PAD_DAC2_REG, RTC_IO_PDAC2_XPD_DAC | RTC_IO_PDAC2_DAC_XPD_FORCE);
+    }
+    portEXIT_CRITICAL(&rtc_spinlock);
+
+    return ESP_OK;
+}
+
+esp_err_t dac_output_voltage(dac_channel_t channel, uint8_t dac_value)
+{
+    RTC_MODULE_CHECK((channel >= DAC_CHANNEL_1) && (channel < DAC_CHANNEL_MAX), DAC_ERR_STR_CHANNEL_ERROR, ESP_ERR_INVALID_ARG);
+    portENTER_CRITICAL(&rtc_spinlock);
+    //Disable Tone
+    CLEAR_PERI_REG_MASK(SENS_SAR_DAC_CTRL1_REG, SENS_SW_TONE_EN);
+
+    //Disable Channel Tone
+    if (channel == DAC_CHANNEL_1) {
+        CLEAR_PERI_REG_MASK(SENS_SAR_DAC_CTRL2_REG, SENS_DAC_CW_EN1_M);
+    } else if (channel == DAC_CHANNEL_2) {
+        CLEAR_PERI_REG_MASK(SENS_SAR_DAC_CTRL2_REG, SENS_DAC_CW_EN2_M);
+    }
+
+    //Set the Dac value
+    if (channel == DAC_CHANNEL_1) {
+        SET_PERI_REG_BITS(RTC_IO_PAD_DAC1_REG, RTC_IO_PDAC1_DAC, dac_value, RTC_IO_PDAC1_DAC_S);   //dac_output
+    } else if (channel == DAC_CHANNEL_2) {
+        SET_PERI_REG_BITS(RTC_IO_PAD_DAC2_REG, RTC_IO_PDAC2_DAC, dac_value, RTC_IO_PDAC2_DAC_S);   //dac_output
+    }
+
+    portEXIT_CRITICAL(&rtc_spinlock);
 
     return ESP_OK;
 }
 
 esp_err_t dac_out_voltage(dac_channel_t channel, uint8_t dac_value)
 {
-    RTC_MODULE_CHECK(channel < DAC_CHANNEL_MAX, "DAC Channel Err", ESP_ERR_INVALID_ARG);
+    RTC_MODULE_CHECK((channel >= DAC_CHANNEL_1) && (channel < DAC_CHANNEL_MAX), DAC_ERR_STR_CHANNEL_ERROR, ESP_ERR_INVALID_ARG);
     portENTER_CRITICAL(&rtc_spinlock);
     //Disable Tone
     CLEAR_PERI_REG_MASK(SENS_SAR_DAC_CTRL1_REG, SENS_SW_TONE_EN);
@@ -678,8 +743,24 @@ esp_err_t dac_out_voltage(dac_channel_t channel, uint8_t dac_value)
     portEXIT_CRITICAL(&rtc_spinlock);
     //dac pad init
     dac_rtc_pad_init(channel);
-    dac_out_enable(channel);
+    dac_output_enable(channel);
 
+    return ESP_OK;
+}
+
+esp_err_t dac_i2s_enable()
+{
+    portENTER_CRITICAL(&rtc_spinlock);
+    SET_PERI_REG_MASK(SENS_SAR_DAC_CTRL1_REG, SENS_DAC_DIG_FORCE_M | SENS_DAC_CLK_INV_M);
+    portEXIT_CRITICAL(&rtc_spinlock);
+    return ESP_OK;
+}
+
+esp_err_t dac_i2s_disable()
+{
+    portENTER_CRITICAL(&rtc_spinlock);
+    CLEAR_PERI_REG_MASK(SENS_SAR_DAC_CTRL1_REG, SENS_DAC_DIG_FORCE_M | SENS_DAC_CLK_INV_M);
+    portEXIT_CRITICAL(&rtc_spinlock);
     return ESP_OK;
 }
 
@@ -720,4 +801,100 @@ int hall_sensor_read()
     adc1_config_channel_atten(ADC1_CHANNEL_0, ADC_ATTEN_0db);
     adc1_config_channel_atten(ADC1_CHANNEL_3, ADC_ATTEN_0db);
     return hall_sensor_get_value();
+}
+
+/*---------------------------------------------------------------
+                        INTERRUPT HANDLER
+---------------------------------------------------------------*/
+
+
+typedef struct rtc_isr_handler_ {
+    uint32_t mask;
+    intr_handler_t handler;
+    void* handler_arg;
+    SLIST_ENTRY(rtc_isr_handler_) next;
+} rtc_isr_handler_t;
+
+static SLIST_HEAD(rtc_isr_handler_list_, rtc_isr_handler_) s_rtc_isr_handler_list =
+        SLIST_HEAD_INITIALIZER(s_rtc_isr_handler_list);
+portMUX_TYPE s_rtc_isr_handler_list_lock = portMUX_INITIALIZER_UNLOCKED;
+static intr_handle_t s_rtc_isr_handle;
+
+static void rtc_isr(void* arg)
+{
+    uint32_t status = REG_READ(RTC_CNTL_INT_ST_REG);
+    rtc_isr_handler_t* it;
+    portENTER_CRITICAL(&s_rtc_isr_handler_list_lock);
+    SLIST_FOREACH(it, &s_rtc_isr_handler_list, next) {
+        if (it->mask & status) {
+            portEXIT_CRITICAL(&s_rtc_isr_handler_list_lock);
+            (*it->handler)(it->handler_arg);
+            portENTER_CRITICAL(&s_rtc_isr_handler_list_lock);
+        }
+    }
+    portEXIT_CRITICAL(&s_rtc_isr_handler_list_lock);
+    REG_WRITE(RTC_CNTL_INT_CLR_REG, status);
+}
+
+static esp_err_t rtc_isr_ensure_installed()
+{
+    esp_err_t err = ESP_OK;
+    portENTER_CRITICAL(&s_rtc_isr_handler_list_lock);
+    if (s_rtc_isr_handle) {
+        goto out;
+    }
+
+    REG_WRITE(RTC_CNTL_INT_ENA_REG, 0);
+    REG_WRITE(RTC_CNTL_INT_CLR_REG, UINT32_MAX);
+    err = esp_intr_alloc(ETS_RTC_CORE_INTR_SOURCE, 0, &rtc_isr, NULL, &s_rtc_isr_handle);
+    if (err != ESP_OK) {
+        goto out;
+    }
+
+out:
+    portEXIT_CRITICAL(&s_rtc_isr_handler_list_lock);
+    return err;
+}
+
+
+esp_err_t rtc_isr_register(intr_handler_t handler, void* handler_arg, uint32_t rtc_intr_mask)
+{
+    esp_err_t err = rtc_isr_ensure_installed();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    rtc_isr_handler_t* item = malloc(sizeof(*item));
+    if (item == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    item->handler = handler;
+    item->handler_arg = handler_arg;
+    item->mask = rtc_intr_mask;
+    portENTER_CRITICAL(&s_rtc_isr_handler_list_lock);
+    SLIST_INSERT_HEAD(&s_rtc_isr_handler_list, item, next);
+    portEXIT_CRITICAL(&s_rtc_isr_handler_list_lock);
+    return ESP_OK;
+}
+
+esp_err_t rtc_isr_deregister(intr_handler_t handler, void* handler_arg)
+{
+    rtc_isr_handler_t* it;
+    rtc_isr_handler_t* prev = NULL;
+    bool found = false;
+    portENTER_CRITICAL(&s_rtc_isr_handler_list_lock);
+    SLIST_FOREACH(it, &s_rtc_isr_handler_list, next) {
+        if (it->handler == handler && it->handler_arg == handler_arg) {
+            if (it == SLIST_FIRST(&s_rtc_isr_handler_list)) {
+                SLIST_REMOVE_HEAD(&s_rtc_isr_handler_list, next);
+            } else {
+                SLIST_REMOVE_AFTER(prev, next);
+            }
+            found = true;
+            break;
+        }
+        prev = it;
+    }
+    portEXIT_CRITICAL(&s_rtc_isr_handler_list_lock);
+    return found ? ESP_OK : ESP_ERR_INVALID_STATE;
 }

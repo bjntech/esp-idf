@@ -93,6 +93,9 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include "xtensa_rtos.h"
 #include "esp_panic.h"
 #include "sdkconfig.h"
+#include "soc/soc.h"
+#include "soc/dport_reg.h"
+
 /*
   Define for workaround: pin no-cpu-affinity tasks to a cpu when fpu is used.
   Please change this when the tcb structure is changed
@@ -360,19 +363,16 @@ _xt_panic:
 
     /* _xt_context_save seems to save the current a0, but we need the interuptees a0. Fix this. */
     rsr     a0, EXCSAVE_1                   /* save interruptee's a0 */
+
     s32i    a0, sp, XT_STK_A0
 
-    /* Set up PS for C, disable all interrupts, and clear EXCM. */
-    movi    a0, PS_INTLEVEL(7) | PS_UM | PS_WOE
+    /* Set up PS for C, disable all interrupts except NMI and debug, and clear EXCM. */
+    movi    a0, PS_INTLEVEL(5) | PS_UM | PS_WOE
     wsr     a0, PS
 
     //Call panic handler
     mov     a6,sp
     call4 panicHandler
-
-1:  j       1b                              /* loop infinitely */
-
-    retw
 
 
     .align 4
@@ -471,28 +471,10 @@ Debug Exception.
     .section    .DebugExceptionVector.text, "ax"
     .global     _DebugExceptionVector
     .align      4
-
+    .global     xt_debugexception
 _DebugExceptionVector:
-
-    #ifdef XT_SIMULATOR
-    /*
-    In the simulator, let the debugger (if any) handle the debug exception,
-    or simply stop the simulation:
-    */
-    wsr     a2, EXCSAVE+XCHAL_DEBUGLEVEL    /* save a2 where sim expects it */
-    movi    a2, SYS_gdb_enter_sktloop
-    simcall                                 /* have ISS handle debug exc. */
-    #elif 0 /* change condition to 1 to use the HAL minimal debug handler */
-    wsr     a3, EXCSAVE+XCHAL_DEBUGLEVEL
-    movi    a3, xthal_debugexc_defhndlr_nw  /* use default debug handler */
-    jx      a3
-    #else
-    wsr     a0, EXCSAVE+XCHAL_DEBUGLEVEL    /* save original a0 somewhere */
-    movi    a0,PANIC_RSN_DEBUGEXCEPTION
-    wsr     a0,EXCCAUSE
-    call0   _xt_panic                       /* does not return */
-    rfi     XCHAL_DEBUGLEVEL                /* make a0 point here not later */
-    #endif
+    wsr     a0, EXCSAVE+XCHAL_DEBUGLEVEL    /* preserve a0 */
+    call0   xt_debugexception            /* load exception handler */
 
     .end        literal_prefix
 
@@ -931,7 +913,6 @@ _xt_coproc_exc:
     addx4   a0, a5, a0                      /* a0 = &_xt_coproc_mask[n] */
     l32i    a0, a0, 0                       /* a0 = (n << 16) | (1 << n) */
 
-    /* TODO: Remove this as soon as coprocessor state moving works across cores - JD */
     /* FPU operations are incompatible with non-pinned tasks. If we have a FPU operation
        here, to keep the entire thing from crashing, it's better to pin the task to whatever
        core we're running on now. */
@@ -944,13 +925,20 @@ _xt_coproc_exc:
 
     /* Grab correct xt_coproc_owner_sa for this core */
     movi    a2, XCHAL_CP_MAX << 2
-    mull    a2, a2, a3
+    mull    a2, a2, a3                      /* multiply by current processor id */
     movi    a3, _xt_coproc_owner_sa         /* a3 = base of owner array */
-    add     a3, a3, a2
+    add     a3, a3, a2                      /* a3 = owner area needed for this processor */
 
     extui   a2, a0, 0, 16                   /* coprocessor bitmask portion */
     or      a4, a4, a2                      /* a4 = CPENABLE | (1 << n) */
     wsr     a4, CPENABLE
+
+/* 
+Keep loading _xt_coproc_owner_sa[n] atomic (=load once, then use that value
+everywhere): _xt_coproc_release assumes it works like this in order not to need
+locking.
+*/
+
 
     /* Get old coprocessor owner thread (save area ptr) and assign new one.  */
     addx4   a3,  a5, a3                      /* a3 = &_xt_coproc_owner_sa[n] */
@@ -1054,9 +1042,6 @@ _xt_coproc_exc:
 
     /* Co-processor exception occurred outside a thread (not supported). */
 .L_xt_coproc_invalid:
-    #if XCHAL_HAVE_DEBUG
-    break   1, 1                            /* unhandled user exception */
-    #endif
     movi    a0,PANIC_RSN_COPROCEXCEPTION
     wsr     a0,EXCCAUSE
     call0   _xt_panic                       /* not in a thread (invalid) */
@@ -1525,9 +1510,9 @@ the minimum necessary before jumping to the handler in the .text section.
 *******************************************************************************/
 
 /*
-Currently only shells for high priority interrupt handlers are provided
-here. However a template and example can be found in the Cadence Design Systems tools
-documentation: "Microprocessor Programmer's Guide".
+These stubs just call xt_highintX/xt_nmi to handle the real interrupt. Please define
+these in an external assembly source file. If these symbols are not defined anywhere
+else, the defaults in xtensa_vector_defaults.S are used.
 */
 
 #if XCHAL_NUM_INTLEVELS >=2 && XCHAL_EXCM_LEVEL <2 && XCHAL_DEBUGLEVEL !=2
@@ -1536,36 +1521,13 @@ documentation: "Microprocessor Programmer's Guide".
     .section    .Level2InterruptVector.text, "ax"
     .global     _Level2Vector
     .type       _Level2Vector,@function
+    .global     xt_highint2
     .align      4
 _Level2Vector:
     wsr     a0, EXCSAVE_2                   /* preserve a0 */
-    call0   _xt_highint2                    /* load interrupt handler */
+    call0   xt_highint2                    /* load interrupt handler */
 
     .end        literal_prefix
-
-    .section .iram1,"ax"
-    .type       _xt_highint2,@function
-    .align      4
-_xt_highint2:
-
-    #ifdef XT_INTEXC_HOOKS
-    /* Call interrupt hook if present to (pre)handle interrupts. */
-    movi    a0, _xt_intexc_hooks
-    l32i    a0, a0, 2<<2
-    beqz    a0, 1f
-.Ln_xt_highint2_call_hook:
-    callx0  a0                              /* must NOT disturb stack! */
-1:
-    #endif
-
-    /* USER_EDIT:
-    ADD HIGH PRIORITY LEVEL 2 INTERRUPT HANDLER CODE HERE.
-    */
-
-    .align  4
-.L_xt_highint2_exit:
-    rsr     a0, EXCSAVE_2                   /* restore a0 */
-    rfi     2
 
 #endif  /* Level 2 */
 
@@ -1575,37 +1537,14 @@ _xt_highint2:
     .section    .Level3InterruptVector.text, "ax"
     .global     _Level3Vector
     .type       _Level3Vector,@function
+    .global     xt_highint3
     .align      4
 _Level3Vector:
     wsr     a0, EXCSAVE_3                   /* preserve a0 */
-    call0   _xt_highint3                    /* load interrupt handler */
+    call0   xt_highint3                    /* load interrupt handler */
     /* never returns here - call0 is used as a jump (see note at top) */
 
     .end        literal_prefix
-
-    .section .iram1,"ax"
-    .type       _xt_highint3,@function
-    .align      4
-_xt_highint3:
-
-    #ifdef XT_INTEXC_HOOKS
-    /* Call interrupt hook if present to (pre)handle interrupts. */
-    movi    a0, _xt_intexc_hooks
-    l32i    a0, a0, 3<<2
-    beqz    a0, 1f
-.Ln_xt_highint3_call_hook:
-    callx0  a0                              /* must NOT disturb stack! */
-1:
-    #endif
-
-    /* USER_EDIT:
-    ADD HIGH PRIORITY LEVEL 3 INTERRUPT HANDLER CODE HERE.
-    */
-
-    .align  4
-.L_xt_highint3_exit:
-    rsr     a0, EXCSAVE_3                   /* restore a0 */
-    rfi     3
 
 #endif  /* Level 3 */
 
@@ -1615,59 +1554,14 @@ _xt_highint3:
     .section    .Level4InterruptVector.text, "ax"
     .global     _Level4Vector
     .type       _Level4Vector,@function
+    .global     xt_highint4
     .align      4
 _Level4Vector:
     wsr     a0, EXCSAVE_4                   /* preserve a0 */
-    call0   _xt_highint4                    /* load interrupt handler */
+    call0   xt_highint4                    /* load interrupt handler */
     /* never returns here - call0 is used as a jump (see note at top) */
 
     .end        literal_prefix
-
-    .section .iram1,"ax"
-    .type       _xt_highint4,@function
-    .align      4
-_xt_highint4:
-
-    #ifdef XT_INTEXC_HOOKS
-    /* Call interrupt hook if present to (pre)handle interrupts. */
-    movi    a0, _xt_intexc_hooks
-    l32i    a0, a0, 4<<2
-    beqz    a0, 1f
-.Ln_xt_highint4_call_hook:
-    callx0  a0                              /* must NOT disturb stack! */
-1:
-    #endif
-
-    /* USER_EDIT:
-    ADD HIGH PRIORITY LEVEL 4 INTERRUPT HANDLER CODE HERE.
-    */
-
-
-
-    /* On the ESP32, this level is used for the INT_WDT handler. If that triggers, the program is stuck with interrupts
-       off and the CPU should panic. */
-    rsr     a0, EXCSAVE_4
-    wsr     a0, EXCSAVE_1 /* panic handler reads this register */
-    /* Set EXCCAUSE to reflect cause of the wdt int trigger */
-    movi    a0,PANIC_RSN_INTWDT_CPU0
-    wsr     a0,EXCCAUSE
-#if CONFIG_INT_WDT_CHECK_CPU1
-    /* Check if the cause is the app cpu failing to tick.*/
-    movi    a0, int_wdt_app_cpu_ticked
-    l32i    a0, a0, 0
-    bnez    a0, 1f
-    /* It is. Modify cause. */
-    movi    a0,PANIC_RSN_INTWDT_CPU1
-    wsr     a0,EXCCAUSE
-1:
-#endif
-    call0 _xt_panic
-
-
-    .align  4
-.L_xt_highint4_exit:
-    rsr     a0, EXCSAVE_4                   /* restore a0 */
-    rfi     4
 
 #endif  /* Level 4 */
 
@@ -1677,37 +1571,14 @@ _xt_highint4:
     .section    .Level5InterruptVector.text, "ax"
     .global     _Level5Vector
     .type       _Level5Vector,@function
+    .global     xt_highint5
     .align      4
 _Level5Vector:
     wsr     a0, EXCSAVE_5                   /* preserve a0 */
-    call0   _xt_highint5                    /* load interrupt handler */
+    call0   xt_highint5                    /* load interrupt handler */
     /* never returns here - call0 is used as a jump (see note at top) */
 
     .end        literal_prefix
-
-    .section .iram1,"ax"
-    .type       _xt_highint5,@function
-    .align      4
-_xt_highint5:
-
-    #ifdef XT_INTEXC_HOOKS
-    /* Call interrupt hook if present to (pre)handle interrupts. */
-    movi    a0, _xt_intexc_hooks
-    l32i    a0, a0, 5<<2
-    beqz    a0, 1f
-.Ln_xt_highint5_call_hook:
-    callx0  a0                              /* must NOT disturb stack! */
-1:
-    #endif
-
-    /* USER_EDIT:
-    ADD HIGH PRIORITY LEVEL 5 INTERRUPT HANDLER CODE HERE.
-    */
-
-    .align  4
-.L_xt_highint5_exit:
-    rsr     a0, EXCSAVE_5                   /* restore a0 */
-    rfi     5
 
 #endif  /* Level 5 */
 
@@ -1717,37 +1588,14 @@ _xt_highint5:
     .section    .Level6InterruptVector.text, "ax"
     .global     _Level6Vector
     .type       _Level6Vector,@function
+    .global     xt_highint6
     .align      4
 _Level6Vector:
     wsr     a0, EXCSAVE_6                   /* preserve a0 */
-    call0   _xt_highint6                    /* load interrupt handler */
+    call0   xt_highint6                    /* load interrupt handler */
     /* never returns here - call0 is used as a jump (see note at top) */
 
     .end        literal_prefix
-
-    .section .iram1,"ax"
-    .type       _xt_highint6,@function
-    .align      4
-_xt_highint6:
-
-    #ifdef XT_INTEXC_HOOKS
-    /* Call interrupt hook if present to (pre)handle interrupts. */
-    movi    a0, _xt_intexc_hooks
-    l32i    a0, a0, 6<<2
-    beqz    a0, 1f
-.Ln_xt_highint6_call_hook:
-    callx0  a0                              /* must NOT disturb stack! */
-1:
-    #endif
-
-    /* USER_EDIT:
-    ADD HIGH PRIORITY LEVEL 6 INTERRUPT HANDLER CODE HERE.
-    */
-
-    .align  4
-.L_xt_highint6_exit:
-    rsr     a0, EXCSAVE_6                   /* restore a0 */
-    rfi     6
 
 #endif  /* Level 6 */
 
@@ -1757,37 +1605,14 @@ _xt_highint6:
     .section    .NMIExceptionVector.text, "ax"
     .global     _NMIExceptionVector
     .type       _NMIExceptionVector,@function
+    .global     xt_nmi
     .align      4
 _NMIExceptionVector:
     wsr     a0, EXCSAVE + XCHAL_NMILEVEL  _ /* preserve a0 */
-    call0   _xt_nmi                         /* load interrupt handler */
+    call0   xt_nmi                         /* load interrupt handler */
     /* never returns here - call0 is used as a jump (see note at top) */
 
     .end        literal_prefix
-
-    .section .iram1,"ax"
-    .type       _xt_nmi,@function
-    .align      4
-_xt_nmi:
-
-    #ifdef XT_INTEXC_HOOKS
-    /* Call interrupt hook if present to (pre)handle interrupts. */
-    movi    a0, _xt_intexc_hooks
-    l32i    a0, a0, XCHAL_NMILEVEL<<2
-    beqz    a0, 1f
-.Ln_xt_nmi_call_hook:
-    callx0  a0                              /* must NOT disturb stack! */
-1:
-    #endif
-
-    /* USER_EDIT:
-    ADD HIGH PRIORITY NON-MASKABLE INTERRUPT (NMI) HANDLER CODE HERE.
-    */
-
-    .align  4
-.L_xt_nmi_exit:
-    rsr     a0, EXCSAVE + XCHAL_NMILEVEL    /* restore a0 */
-    rfi     XCHAL_NMILEVEL
 
 #endif  /* NMI */
 
