@@ -40,6 +40,12 @@ bool esp_spiram_test();
 
 
 /**
+ * @brief Add the initialized SPI RAM to the heap allocator.
+ */
+esp_err_t esp_spiram_add_to_heapalloc();
+
+
+/**
  * @brief Get the size of the attached SPI RAM chip selected in menuconfig
  *
  * @return Size in bytes, or 0 if no external RAM chip support compiled in.
@@ -56,6 +62,18 @@ size_t esp_spiram_get_size();
  */
 void esp_spiram_writeback_cache();
 
+
+
+/**
+ * @brief Reserve a pool of internal memory for specific DMA/internal allocations
+ *
+ * @param size Size of reserved pool in bytes
+ *
+ * @return
+ *          - ESP_OK on success
+ *          - ESP_ERR_NO_MEM when no memory available for pool
+ */
+esp_err_t esp_spiram_reserve_dma_pool(size_t size);
 
 
 #endif
