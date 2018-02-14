@@ -408,7 +408,7 @@ esp_err_t tcpip_adapter_set_ip_info(tcpip_adapter_if_t tcpip_if, tcpip_adapter_i
 
     if (p_netif != NULL && netif_is_up(p_netif)) {
         netif_set_addr(p_netif, &ip_info->ip, &ip_info->netmask, &ip_info->gw);
-        if (!(ip4_addr_isany_val(ip_info->ip) || ip4_addr_isany_val(ip_info->ip) || ip4_addr_isany_val(ip_info->ip))) {
+        if (!(ip4_addr_isany_val(ip_info->ip) || ip4_addr_isany_val(ip_info->netmask) || ip4_addr_isany_val(ip_info->gw))) {
             system_event_t evt;
             evt.event_id = SYSTEM_EVENT_STA_GOT_IP;
             evt.event_info.got_ip.ip_changed = false;
@@ -1178,6 +1178,20 @@ static esp_err_t tcpip_adapter_reset_ip_info(tcpip_adapter_if_t tcpip_if)
     ip4_addr_set_zero(&esp_ip[tcpip_if].ip);
     ip4_addr_set_zero(&esp_ip[tcpip_if].gw);
     ip4_addr_set_zero(&esp_ip[tcpip_if].netmask);
+    return ESP_OK;
+}
+
+esp_err_t tcpip_adapter_get_netif(tcpip_adapter_if_t tcpip_if, void ** netif)
+{
+    if (tcpip_if >= TCPIP_ADAPTER_IF_MAX) {
+        return ESP_ERR_TCPIP_ADAPTER_INVALID_PARAMS;
+    }
+
+    *netif = esp_netif[tcpip_if];
+
+    if (*netif == NULL) {
+        return ESP_ERR_TCPIP_ADAPTER_IF_NOT_READY;
+    }
     return ESP_OK;
 }
 

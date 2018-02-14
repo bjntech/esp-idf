@@ -19,6 +19,7 @@ TEST_CASE_PATTERN = {
     "test point 1": "basic function",
     "version": "v1 (2016-12-06)",
     "test environment": "UT_T1_1",
+    "reset": "",
     "expected result": "1. set succeed"
 }
 
@@ -61,7 +62,7 @@ class Parser(object):
         :param elf_file: elf file path
         :param app_name: built unit test app name
         """
-        subprocess.check_output('xtensa-esp32-elf-objdump -t {} | grep \ test_desc > case_address.tmp'.format(elf_file),
+        subprocess.check_output('xtensa-esp32-elf-objdump -t {} | grep test_desc > case_address.tmp'.format(elf_file),
                                 shell=True)
         subprocess.check_output('xtensa-esp32-elf-objdump -s {} > section_table.tmp'.format(elf_file), shell=True)
 
@@ -182,6 +183,7 @@ class Parser(object):
                           "test point 2": prop["module"],
                           "steps": name,
                           "test environment": prop["test_env"],
+                          "reset": prop["reset"],
                           "sub module": self.module_map[prop["module"]]['sub module'],
                           "summary": name})
         return test_case

@@ -665,6 +665,7 @@ BOOLEAN BTM_ReadConnectedTransportAddress(BD_ADDR remote_bda, tBT_TRANSPORT tran
 
     /* if no device can be located, return */
     if (p_dev_rec == NULL) {
+        memset(remote_bda, 0, BD_ADDR_LEN);
         return FALSE;
     }
 
@@ -812,7 +813,7 @@ tBTM_STATUS BTM_SetBleDataLength(BD_ADDR bd_addr, UINT16 tx_pdu_length)
     }
 
     if (!HCI_LE_DATA_LEN_EXT_SUPPORTED(p_acl->peer_le_features)) {
-        BTM_TRACE_DEBUG("%s failed, peer does not support request", __FUNCTION__);
+        BTM_TRACE_ERROR("%s failed, peer does not support request", __FUNCTION__);
         return BTM_PEER_LE_DATA_LEN_UNSUPPORTED;
     }
 
@@ -1220,6 +1221,14 @@ void btm_sec_save_le_key(BD_ADDR bd_addr, tBTM_LE_KEY_TYPE key_type, tBTM_LE_KEY
             p_rec->ble.keys.sec_level = p_keys->lenc_key.sec_level;
             p_rec->ble.keys.key_size = p_keys->lenc_key.key_size;
             p_rec->ble.key_type |= BTM_LE_KEY_LENC;
+
+            /* Set that link key is known since this shares field with BTM_SEC_FLAG_LKEY_KNOWN flag in btm_api.h*/
+            p_rec->sec_flags |=  BTM_SEC_LE_LINK_KEY_KNOWN;
+            if ( p_keys->pcsrk_key.sec_level == SMP_SEC_AUTHENTICATED) {
+                p_rec->sec_flags |= BTM_SEC_LE_LINK_KEY_AUTHED;
+            } else {
+                p_rec->sec_flags &= ~BTM_SEC_LE_LINK_KEY_AUTHED;
+            }
 
             BTM_TRACE_DEBUG("BTM_LE_KEY_LENC key_type=0x%x DIV=0x%x key_size=0x%x sec_level=0x%x",
                             p_rec->ble.key_type,

@@ -281,13 +281,13 @@ config SYSTEM_EVENT_QUEUE_SIZE
 
 config SYSTEM_EVENT_TASK_STACK_SIZE
     int "Event loop task stack size"
-    default 4096
+    default 2048
     help
         Config system event task stack size in different application.
 
 config MAIN_TASK_STACK_SIZE
     int "Main task stack size"
-    default 4096
+    default 3584
     help
         Configure the "main task" stack size. This is the stack of the task
         which calls app_main(). If app_main() returns then this task is deleted
@@ -310,7 +310,7 @@ config IPC_TASK_STACK_SIZE
 
 config TIMER_TASK_STACK_SIZE
     int "High-resolution timer task stack size"
-    default 4096
+    default 3584
     range 2048 65536
     help
         Configure the stack size of esp_timer/ets_timer task. This task is used
@@ -521,7 +521,8 @@ config INT_WDT
 config INT_WDT_TIMEOUT_MS
     int "Interrupt watchdog timeout (ms)"
     depends on INT_WDT
-    default 300
+    default 300 if !SPIRAM_SUPPORT
+    default 800 if SPIRAM_SUPPORT
     range 10 10000
     help
         The timeout of the watchdog, in miliseconds. Make this higher than the FreeRTOS tick rate.
@@ -534,45 +535,50 @@ config INT_WDT_CHECK_CPU1
         Also detect if interrupts on CPU 1 are disabled for too long.
 
 config TASK_WDT
-    bool "Task watchdog"
+    bool "Initialize Task Watchdog Timer on startup"
     default y
     help
-        This watchdog timer can be used to make sure individual tasks are still running.
+        The Task Watchdog Timer can be used to make sure individual tasks are still
+        running. Enabling this option will cause the Task Watchdog Timer to be
+        initialized automatically at startup. The Task Watchdog timer can be 
+        initialized after startup as well (see Task Watchdog Timer API Reference)
 
 config TASK_WDT_PANIC
-    bool "Invoke panic handler when Task Watchdog is triggered"
+    bool "Invoke panic handler on Task Watchdog timeout"
     depends on TASK_WDT
     default n
     help
-        Normally, the Task Watchdog will only print out a warning if it detects it has not
-        been fed. If this is enabled, it will invoke the panic handler instead, which
-        can then halt or reboot the chip.
+        If this option is enabled, the Task Watchdog Timer will be configured to
+        trigger the panic handler when it times out. This can also be configured
+        at run time (see Task Watchdog Timer API Reference)
 
 config TASK_WDT_TIMEOUT_S
-    int "Task watchdog timeout (seconds)"
+    int "Task Watchdog timeout period (seconds)"
     depends on TASK_WDT
     range 1 60
     default 5
     help
-        Timeout for the task WDT, in seconds.
+        Timeout period configuration for the Task Watchdog Timer in seconds.
+        This is also configurable at run time (see Task Watchdog Timer API Reference)
 
-config TASK_WDT_CHECK_IDLE_TASK
-    bool "Task watchdog watches CPU0 idle task"
+config TASK_WDT_CHECK_IDLE_TASK_CPU0
+    bool "Watch CPU0 Idle Task"
     depends on TASK_WDT
     default y
     help
-        With this turned on, the task WDT can detect if the idle task is not called within the task
-        watchdog timeout period. The idle task not being called usually is a symptom of another
-        task hoarding the CPU. It is also a bad thing because FreeRTOS household tasks depend on the
-        idle task getting some runtime every now and then. Take Care: With this disabled, this
-        watchdog will trigger if no tasks register themselves within the timeout value.
+        If this option is enabled, the Task Watchdog Timer will watch the CPU0
+        Idle Task. Having the Task Watchdog watch the Idle Task allows for detection
+        of CPU starvation as the Idle Task not being called is usually a symptom of
+        CPU starvation. Starvation of the Idle Task is detrimental as FreeRTOS household
+        tasks depend on the Idle Task getting some runtime every now and then.
 
 config TASK_WDT_CHECK_IDLE_TASK_CPU1
-    bool "Task watchdog also watches CPU1 idle task"
-    depends on TASK_WDT_CHECK_IDLE_TASK && !FREERTOS_UNICORE
+    bool "Watch CPU1 Idle Task"
+    depends on TASK_WDT && !FREERTOS_UNICORE
     default y
     help
-        Also check the idle task that runs on CPU1.
+        If this option is enabled, the Task Wtachdog Timer will wach the CPU1
+        Idle Task.
 
 #The brownout detector code is disabled (by making it depend on a nonexisting symbol) because the current revision of ESP32
 #silicon has a bug in the brown-out detector, rendering it unusable for resetting the CPU.
@@ -589,26 +595,28 @@ choice BROWNOUT_DET_LVL_SEL
     depends on BROWNOUT_DET
     default BROWNOUT_DET_LVL_SEL_25
     help
-        The brownout detector will reset the chip when the supply voltage is below this level.
+        The brownout detector will reset the chip when the supply voltage is approximately
+        below this level. Note that there may be some variation of brownout voltage level
+        between each ESP32 chip.
 
 #The voltage levels here are estimates, more work needs to be done to figure out the exact voltages
 #of the brownout threshold levels.
 config BROWNOUT_DET_LVL_SEL_0
-    bool "2.1V"
+    bool "2.43V +/- 0.05"
 config BROWNOUT_DET_LVL_SEL_1
-    bool "2.2V"
+    bool "2.48V +/- 0.05"
 config BROWNOUT_DET_LVL_SEL_2
-    bool "2.3V"
+    bool "2.58V +/- 0.05"
 config BROWNOUT_DET_LVL_SEL_3
-    bool "2.4V"
+    bool "2.62V +/- 0.05"
 config BROWNOUT_DET_LVL_SEL_4
-    bool "2.5V"
+    bool "2.67V +/- 0.05"
 config BROWNOUT_DET_LVL_SEL_5
-    bool "2.6V"
+    bool "2.70V +/- 0.05"
 config BROWNOUT_DET_LVL_SEL_6
-    bool "2.7V"
+    bool "2.77V +/- 0.05"
 config BROWNOUT_DET_LVL_SEL_7
-    bool "2.8V"
+    bool "2.80V +/- 0.05"
 endchoice
 
 config BROWNOUT_DET_LVL
@@ -623,6 +631,10 @@ config BROWNOUT_DET_LVL
     default 7 if BROWNOUT_DET_LVL_SEL_7
 
 
+# Note about the use of "FRC1" name: currently FRC1 timer is not used for
+# high resolution timekeeping anymore. Instead the esp_timer API, implemented
+# using FRC2 timer, is used.
+# FRC1 name in the option name is kept for compatibility.
 choice ESP32_TIME_SYSCALL
     prompt "Timers used for gettimeofday function"
     default ESP32_TIME_SYSCALL_USE_RTC_FRC1
@@ -630,12 +642,12 @@ choice ESP32_TIME_SYSCALL
         This setting defines which hardware timers are used to
         implement 'gettimeofday' and 'time' functions in C library.
 
-        - If only FRC1 timer is used, gettimeofday will provide time at
-          microsecond resolution. Time will not be preserved when going
-          into deep sleep mode.
-        - If both FRC1 and RTC timers are used, timekeeping will
+        - If both high-resolution and RTC timers are used, timekeeping will
           continue in deep sleep. Time will be reported at 1 microsecond
-          resolution.
+          resolution. This is the default, and the recommended option.
+        - If only high-resolution timer is used, gettimeofday will
+          provide time at microsecond resolution. 
+          Time will not be preserved when going into deep sleep mode.
         - If only RTC timer is used, timekeeping will continue in
           deep sleep, but time will be measured at 6.(6) microsecond
           resolution. Also the gettimeofday function itself may take
@@ -645,12 +657,12 @@ choice ESP32_TIME_SYSCALL
         - When RTC is used for timekeeping, two RTC_STORE registers are
           used to keep time in deep sleep mode.
 
+config ESP32_TIME_SYSCALL_USE_RTC_FRC1
+    bool "RTC and high-resolution timer"
 config ESP32_TIME_SYSCALL_USE_RTC
     bool "RTC"
-config ESP32_TIME_SYSCALL_USE_RTC_FRC1
-    bool "RTC and FRC1"
 config ESP32_TIME_SYSCALL_USE_FRC1
-    bool "FRC1"
+    bool "High-resolution timer"
 config ESP32_TIME_SYSCALL_USE_NONE
     bool "None"
 endchoice
@@ -755,7 +767,6 @@ config NO_BLOBS
 
 config ESP_TIMER_PROFILING
 	bool "Enable esp_timer profiling features"
-	depends on MAKING_ESP_TIMER_A_PUBLIC_API
 	default n
 	help
 		If enabled, esp_timer_dump will dump information such as number of times
@@ -764,6 +775,22 @@ config ESP_TIMER_PROFILING
 		This option has some effect on timer performance and the amount of memory
 		used for timer storage, and should only be used for debugging/testing
 		purposes.
+
+config COMPATIBLE_PRE_V2_1_BOOTLOADERS
+    bool "App compatible with bootloaders before IDF v2.1"
+    default n
+    help
+        Bootloaders before IDF v2.1 did less initialisation of the
+        system clock. This setting needs to be enabled to build an app
+        which can be booted by these older bootloaders.
+
+        If this setting is enabled, the app can be booted by any bootloader
+        from IDF v1.0 up to the current version.
+
+        If this setting is disabled, the app can only be booted by bootloaders
+        from IDF v2.1 or newer.
+
+        Enabling this setting adds approximately 1KB to the app's IRAM usage.
 
 endmenu  # ESP32-Specific
 
@@ -867,16 +894,16 @@ config ESP32_WIFI_DYNAMIC_TX_BUFFER_NUM
         can deliver frames faster than WiFi layer can transmit. In these cases, we may run out of TX
         buffers.
 
-config ESP32_WIFI_AMPDU_ENABLED
-    bool "WiFi AMPDU"
+config ESP32_WIFI_AMPDU_TX_ENABLED
+    bool "WiFi AMPDU TX"
     default y
     help
-        Select this option to enable AMPDU feature
+        Select this option to enable AMPDU TX feature
 
 
 config ESP32_WIFI_TX_BA_WIN
     int "WiFi AMPDU TX BA window size"
-    depends on ESP32_WIFI_AMPDU_ENABLED
+    depends on ESP32_WIFI_AMPDU_TX_ENABLED
     range 2 32
     default 6
     help
@@ -885,9 +912,15 @@ config ESP32_WIFI_TX_BA_WIN
         test the maximum UDP TX throughput with iperf etc. For iperf test in shieldbox, the recommended
         value is 9~12.
 
+config ESP32_WIFI_AMPDU_RX_ENABLED
+    bool "WiFi AMPDU RX"
+    default y
+    help
+        Select this option to enable AMPDU RX feature
+
 config ESP32_WIFI_RX_BA_WIN
     int "WiFi AMPDU RX BA window size"
-    depends on ESP32_WIFI_AMPDU_ENABLED
+    depends on ESP32_WIFI_AMPDU_RX_ENABLED
     range 2 32
     default 6
     help
@@ -907,13 +940,18 @@ endmenu  # Wi-Fi
 menu PHY
 
 config ESP32_PHY_CALIBRATION_AND_DATA_STORAGE
-    bool "Do phy calibration and store calibration data in NVS"
+    bool "Store phy calibration data in NVS"
     default y
     help
         If this option is enabled, NVS will be initialized and calibration data will be loaded from there.
         PHY calibration will be skipped on deep sleep wakeup. If calibration data is not found, full calibration
-        will be performed and stored in NVS. In all other cases, only partial calibration will be performed. 
+        will be performed and stored in NVS. Normally, only partial calibration will be performed. 
+        If this option is disabled, full calibration will be performed.
 
+        If it's easy that your board calibrate bad data, choose 'n'.
+        Two cases for example, you should choose 'n':
+        1.If your board is easy to be booted up with antenna disconnected.
+        2.Because of your board design, each time when you do calibration, the result are too unstable.
         If unsure, choose 'y'.
 
 config ESP32_PHY_INIT_DATA_IN_PARTITION

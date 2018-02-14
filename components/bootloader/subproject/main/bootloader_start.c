@@ -48,6 +48,7 @@
 #include "bootloader_flash.h"
 #include "bootloader_random.h"
 #include "bootloader_config.h"
+#include "bootloader_clock.h"
 
 #include "flash_qio_mode.h"
 
@@ -73,7 +74,8 @@ static void set_cache_and_start_app(uint32_t drom_addr,
     uint32_t irom_size,
     uint32_t entry_addr);
 static void update_flash_config(const esp_image_header_t* pfhdr);
-static void clock_configure(void);
+static void vddsdio_configure();
+static void flash_gpio_configure();
 static void uart_console_configure(void);
 static void wdt_reset_check(void);
 
@@ -443,7 +445,9 @@ static bool load_boot_image(const bootloader_state_t *bs, int start_index, esp_i
 
 void bootloader_main()
 {
-    clock_configure();
+    vddsdio_configure();
+    flash_gpio_configure();
+    bootloader_clock_configure();
     uart_console_configure();
     wdt_reset_check();
     ESP_LOGI(TAG, "ESP-IDF %s 2nd stage bootloader", IDF_VER);
@@ -737,39 +741,100 @@ static void print_flash_info(const esp_image_header_t* phdr)
 }
 
 
-static void clock_configure(void)
+static void vddsdio_configure()
 {
-    /* Set CPU to 80MHz. Keep other clocks unmodified. */
-    rtc_cpu_freq_t cpu_freq = RTC_CPU_FREQ_80M;
-
-    /* On ESP32 rev 0, switching to 80MHz if clock was previously set to
-     * 240 MHz may cause the chip to lock up (see section 3.5 of the errata
-     * document). For rev. 0, switch to 240 instead if it was chosen in
-     * menuconfig.
-     */
-    uint32_t chip_ver_reg = REG_READ(EFUSE_BLK0_RDATA3_REG);
-    if ((chip_ver_reg & EFUSE_RD_CHIP_VER_REV1_M) == 0 &&
-            CONFIG_ESP32_DEFAULT_CPU_FREQ_MHZ == 240) {
-        cpu_freq = RTC_CPU_FREQ_240M;
+#if CONFIG_BOOTLOADER_VDDSDIO_BOOST
+    rtc_vddsdio_config_t cfg = rtc_vddsdio_get_config();
+    if (cfg.enable == 1 && cfg.tieh == 0) {    // VDDSDIO regulator is enabled @ 1.8V
+        cfg.drefh = 3;
+        cfg.drefm = 3;
+        cfg.drefl = 3;
+        cfg.force = 1;
+        rtc_vddsdio_set_config(cfg);
+        ets_delay_us(10); // wait for regulator to become stable
     }
-
-    rtc_clk_config_t clk_cfg = RTC_CLK_CONFIG_DEFAULT();
-    clk_cfg.xtal_freq = CONFIG_ESP32_XTAL_FREQ;
-    clk_cfg.cpu_freq = cpu_freq;
-    clk_cfg.slow_freq = rtc_clk_slow_freq_get();
-    clk_cfg.fast_freq = rtc_clk_fast_freq_get();
-    rtc_clk_init(clk_cfg);
-    /* As a slight optimization, if 32k XTAL was enabled in sdkconfig, we enable
-     * it here. Usually it needs some time to start up, so we amortize at least
-     * part of the start up time by enabling 32k XTAL early.
-     * App startup code will wait until the oscillator has started up.
-     */
-#ifdef CONFIG_ESP32_RTC_CLOCK_SOURCE_EXTERNAL_CRYSTAL
-    if (!rtc_clk_32k_enabled()) {
-        rtc_clk_32k_bootstrap();
-    }
-#endif
+#endif // CONFIG_BOOTLOADER_VDDSDIO_BOOST
 }
+
+
+#define FLASH_CLK_IO      6
+#define FLASH_CS_IO       11
+#define FLASH_SPIQ_IO     7
+#define FLASH_SPID_IO     8
+#define FLASH_SPIWP_IO    10
+#define FLASH_SPIHD_IO    9
+#define FLASH_IO_MATRIX_DUMMY_40M   1
+#define FLASH_IO_MATRIX_DUMMY_80M   2
+static void IRAM_ATTR flash_gpio_configure()
+{
+    int spi_cache_dummy = 0;
+    int drv = 2;
+#if CONFIG_FLASHMODE_QIO
+    spi_cache_dummy = SPI0_R_QIO_DUMMY_CYCLELEN;   //qio 3
+#elif CONFIG_FLASHMODE_QOUT
+    spi_cache_dummy = SPI0_R_FAST_DUMMY_CYCLELEN;  //qout 7
+#elif CONFIG_FLASHMODE_DIO
+    spi_cache_dummy = SPI0_R_DIO_DUMMY_CYCLELEN;   //dio 3
+#elif CONFIG_FLASHMODE_DOUT
+    spi_cache_dummy = SPI0_R_FAST_DUMMY_CYCLELEN;  //dout 7
+#endif
+    /* dummy_len_plus values defined in ROM for SPI flash configuration */
+    extern uint8_t g_rom_spiflash_dummy_len_plus[];
+#if CONFIG_ESPTOOLPY_FLASHFREQ_40M
+    g_rom_spiflash_dummy_len_plus[0] = FLASH_IO_MATRIX_DUMMY_40M;
+    g_rom_spiflash_dummy_len_plus[1] = FLASH_IO_MATRIX_DUMMY_40M;
+    SET_PERI_REG_BITS(SPI_USER1_REG(0), SPI_USR_DUMMY_CYCLELEN_V, spi_cache_dummy + FLASH_IO_MATRIX_DUMMY_40M, SPI_USR_DUMMY_CYCLELEN_S);  //DUMMY
+#elif CONFIG_ESPTOOLPY_FLASHFREQ_80M
+    g_rom_spiflash_dummy_len_plus[0] = FLASH_IO_MATRIX_DUMMY_80M;
+    g_rom_spiflash_dummy_len_plus[1] = FLASH_IO_MATRIX_DUMMY_80M;
+    SET_PERI_REG_BITS(SPI_USER1_REG(0), SPI_USR_DUMMY_CYCLELEN_V, spi_cache_dummy + FLASH_IO_MATRIX_DUMMY_80M, SPI_USR_DUMMY_CYCLELEN_S);  //DUMMY
+    drv = 3;
+#endif
+
+    uint32_t chip_ver = REG_GET_FIELD(EFUSE_BLK0_RDATA3_REG, EFUSE_RD_CHIP_VER_PKG);
+    uint32_t pkg_ver = chip_ver & 0x7;
+
+    if (pkg_ver == EFUSE_RD_CHIP_VER_PKG_ESP32D2WDQ5) {
+        // For ESP32D2WD the SPI pins are already configured
+        // flash clock signal should come from IO MUX.
+        PIN_FUNC_SELECT(PERIPHS_IO_MUX_SD_CLK_U, FUNC_SD_CLK_SPICLK);
+        SET_PERI_REG_BITS(PERIPHS_IO_MUX_SD_CLK_U, FUN_DRV, drv, FUN_DRV_S);
+    } else if (pkg_ver == EFUSE_RD_CHIP_VER_PKG_ESP32PICOD2) {
+        // For ESP32PICOD2 the SPI pins are already configured
+        // flash clock signal should come from IO MUX.
+        PIN_FUNC_SELECT(PERIPHS_IO_MUX_SD_CLK_U, FUNC_SD_CLK_SPICLK);
+        SET_PERI_REG_BITS(PERIPHS_IO_MUX_SD_CLK_U, FUN_DRV, drv, FUN_DRV_S);
+    } else if (pkg_ver == EFUSE_RD_CHIP_VER_PKG_ESP32PICOD4) {
+        // For ESP32PICOD4 the SPI pins are already configured
+        // flash clock signal should come from IO MUX.
+        PIN_FUNC_SELECT(PERIPHS_IO_MUX_SD_CLK_U, FUNC_SD_CLK_SPICLK);
+        SET_PERI_REG_BITS(PERIPHS_IO_MUX_SD_CLK_U, FUN_DRV, drv, FUN_DRV_S);
+    } else {
+        const uint32_t spiconfig = ets_efuse_get_spiconfig();
+        if (spiconfig == EFUSE_SPICONFIG_SPI_DEFAULTS) {
+            gpio_matrix_out(FLASH_CS_IO, SPICS0_OUT_IDX, 0, 0);
+            gpio_matrix_out(FLASH_SPIQ_IO, SPIQ_OUT_IDX, 0, 0);
+            gpio_matrix_in(FLASH_SPIQ_IO, SPIQ_IN_IDX, 0);
+            gpio_matrix_out(FLASH_SPID_IO, SPID_OUT_IDX, 0, 0);
+            gpio_matrix_in(FLASH_SPID_IO, SPID_IN_IDX, 0);
+            gpio_matrix_out(FLASH_SPIWP_IO, SPIWP_OUT_IDX, 0, 0);
+            gpio_matrix_in(FLASH_SPIWP_IO, SPIWP_IN_IDX, 0);
+            gpio_matrix_out(FLASH_SPIHD_IO, SPIHD_OUT_IDX, 0, 0);
+            gpio_matrix_in(FLASH_SPIHD_IO, SPIHD_IN_IDX, 0);
+            //select pin function gpio
+            PIN_FUNC_SELECT(PERIPHS_IO_MUX_SD_DATA0_U, PIN_FUNC_GPIO);
+            PIN_FUNC_SELECT(PERIPHS_IO_MUX_SD_DATA1_U, PIN_FUNC_GPIO);
+            PIN_FUNC_SELECT(PERIPHS_IO_MUX_SD_DATA2_U, PIN_FUNC_GPIO);
+            PIN_FUNC_SELECT(PERIPHS_IO_MUX_SD_DATA3_U, PIN_FUNC_GPIO);
+            PIN_FUNC_SELECT(PERIPHS_IO_MUX_SD_CMD_U, PIN_FUNC_GPIO);
+            // flash clock signal should come from IO MUX.
+            // set drive ability for clock
+            PIN_FUNC_SELECT(PERIPHS_IO_MUX_SD_CLK_U, FUNC_SD_CLK_SPICLK);
+            SET_PERI_REG_BITS(PERIPHS_IO_MUX_SD_CLK_U, FUN_DRV, drv, FUN_DRV_S);
+        }
+    }
+}
+
 
 static void uart_console_configure(void)
 {
@@ -782,8 +847,7 @@ static void uart_console_configure(void)
     uartAttach();
     ets_install_uart_printf();
 
-    // ROM bootloader may have put a lot of text into UART0 FIFO.
-    // Wait for it to be printed.
+    // Wait for UART FIFO to be empty.
     uart_tx_wait_idle(0);
 
 #if CONFIG_CONSOLE_UART_CUSTOM

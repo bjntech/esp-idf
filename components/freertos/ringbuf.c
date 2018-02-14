@@ -32,6 +32,7 @@ typedef enum {
 typedef enum {
     iflag_free = 1,             //Buffer is not read and given back by application, free to overwrite
     iflag_dummydata = 2,        //Data from here to end of ringbuffer is dummy. Restart reading at start of ringbuffer.
+    iflag_wrap = 4,             //Valid for RINGBUF_TYPE_ALLOWSPLIT, indicating that rest of the data is wrapped around
 } itemflag_t;
 
 
@@ -53,6 +54,7 @@ struct  ringbuf_t {
     BaseType_t (*copyItemToRingbufImpl)(ringbuf_t *rb, uint8_t *buffer, size_t buffer_size);
     uint8_t *(*getItemFromRingbufImpl)(ringbuf_t *rb, size_t *length, int wanted_length);
     void (*returnItemToRingbufImpl)(ringbuf_t *rb, void *item);
+    size_t (*getFreeSizeImpl)(ringbuf_t *rb);
 };
 
 
@@ -81,7 +83,6 @@ static int ringbufferFreeMem(ringbuf_t *rb)
     //where read_ptr == free_ptr, messing up the next calculation.
     return free_size-1;
 }
-
 
 //Copies a single item to the ring buffer; refuses to split items. Assumes there is space in the ringbuffer and
 //the ringbuffer is locked. Increases write_ptr to the next item. Returns pdTRUE on
@@ -190,8 +191,23 @@ static BaseType_t copyItemToRingbufAllowSplit(ringbuf_t *rb, uint8_t *buffer, si
             memcpy(rb->write_ptr, buffer, rem_len);
             //Update vars so the code later on will write the rest of the data.
             buffer+=rem_len;
-            rbuffer_size-=rem_len;
             buffer_size-=rem_len;
+            //Re-adjust the rbuffer value to be 4 byte aligned
+            rbuffer_size=(buffer_size+3)&~3;
+            //It is possible that we are here because we checked for 4byte aligned
+            //size, but actual data was smaller.
+            //Eg. For buffer_size = 34, rbuffer_size will be 36. Suppose we had only
+            //42 bytes of memory available, the top level check will fail, as it will
+            //check for availability of 36 + 8 = 44 bytes.
+            //However, the 42 bytes available memory is sufficient for 34 + 8 bytes data
+            //and so, we can return after writing the data. Hence, this check
+            if (buffer_size == 0) {
+                rb->write_ptr=rb->data;
+                return pdTRUE;
+            } else {
+                /* Indicate the wrapping */
+                hdr->flags|=iflag_wrap;
+            }
         } else {
             //Huh, only the header fit. Mark as dummy so the receive function doesn't receive
             //an useless zero-byte packet.
@@ -286,7 +302,10 @@ static uint8_t *getItemFromRingbufDefault(ringbuf_t *rb, size_t *length, int wan
     //...and move the read pointer past the data.
     rb->read_ptr+=sizeof(buf_entry_hdr_t)+((hdr->len+3)&~3);
     //The buffer will wrap around if we don't have room for a header anymore.
-    if ((rb->data + rb->size) - rb->read_ptr < sizeof(buf_entry_hdr_t)) {
+    //Integer typecasting is used because the first operand can result into a -ve
+    //value for cases wherein the ringbuffer size is not a multiple of 4, but the
+    //implementation logic aligns read_ptr to 4-byte boundary
+    if ((int)((rb->data + rb->size) - rb->read_ptr) < (int)sizeof(buf_entry_hdr_t)) {
         rb->read_ptr=rb->data;
     }
     return ret;
@@ -344,6 +363,7 @@ static void returnItemToRingbufDefault(ringbuf_t *rb, void *item) {
     configASSERT((hdr->flags & iflag_dummydata)==0);
     configASSERT((hdr->flags & iflag_free)==0);
     //Mark the buffer as free.
+    hdr->flags&=~iflag_wrap;
     hdr->flags|=iflag_free;
 
     //Do a cleanup pass.
@@ -355,12 +375,20 @@ static void returnItemToRingbufDefault(ringbuf_t *rb, void *item) {
             rb->free_ptr=rb->data;
         } else {
             //Skip past item
+            rb->free_ptr+=sizeof(buf_entry_hdr_t);
+            //Check if the free_ptr overshoots the buffer.
+            //Checking this before aligning free_ptr since it is possible that alignment
+            //will cause pointer to overshoot, if the ringbuf size is not a multiple of 4
+            configASSERT(rb->free_ptr+hdr->len<=rb->data+rb->size);
+            //Align free_ptr to 4 byte boundary. Overshoot condition will result in wrap around below
             size_t len=(hdr->len+3)&~3;
-            rb->free_ptr+=len+sizeof(buf_entry_hdr_t);
-            configASSERT(rb->free_ptr<=rb->data+rb->size);
+            rb->free_ptr+=len;
         }
         //The buffer will wrap around if we don't have room for a header anymore.
-        if ((rb->data+rb->size)-rb->free_ptr < sizeof(buf_entry_hdr_t)) {
+        //Integer typecasting is used because the first operand can result into a -ve
+        //value for cases wherein the ringbuffer size is not a multiple of 4, but the
+        //implementation logic aligns free_ptr to 4-byte boundary
+        if ((int)((rb->data+rb->size)-rb->free_ptr) < (int)sizeof(buf_entry_hdr_t)) {
             rb->free_ptr=rb->data;
         }
         //The free_ptr can not exceed read_ptr, otherwise write_ptr might overwrite read_ptr.
@@ -392,6 +420,67 @@ void xRingbufferPrintInfo(RingbufHandle_t ringbuf)
 }
 
 
+size_t xRingbufferGetCurFreeSize(RingbufHandle_t ringbuf)
+{
+    ringbuf_t *rb=(ringbuf_t *)ringbuf;
+    configASSERT(rb);
+    configASSERT(rb->getFreeSizeImpl);
+    int free_size = rb->getFreeSizeImpl(rb);
+    //Reserve one byte. If we do not do this and the entire buffer is filled, we get a situation
+    //where read_ptr == free_ptr, messing up the next calculation.
+    return free_size - 1;
+}
+
+static size_t getCurFreeSizeByteBuf(ringbuf_t *rb)
+{
+    //Return whatever space is available depending on relative positions of
+    //the free pointer and write pointer. There is no overhead of headers in
+    //this mode
+    int free_size = rb->free_ptr-rb->write_ptr;
+    if (free_size <= 0)
+        free_size += rb->size;
+    return free_size;
+}
+
+static size_t getCurFreeSizeAllowSplit(ringbuf_t *rb)
+{
+    int free_size;
+    //If Both, the write and free pointer are at the start. Hence, the entire buffer
+    //is available (minus the space for the header)
+    if (rb->write_ptr == rb->free_ptr && rb->write_ptr == rb->data) {
+        free_size = rb->size - sizeof(buf_entry_hdr_t);
+    } else if (rb->write_ptr < rb->free_ptr) {
+        //Else if the free pointer is beyond the write pointer, only the space between
+        //them would be available (minus the space for the header)
+        free_size = rb->free_ptr - rb->write_ptr - sizeof(buf_entry_hdr_t);
+    } else {
+        //Else the data can wrap around and 2 headers will be required
+        free_size = rb->free_ptr - rb->write_ptr + rb->size - (2 * sizeof(buf_entry_hdr_t));
+    }
+    return free_size;
+}
+
+static size_t getCurFreeSizeNoSplit(ringbuf_t *rb)
+{
+    int free_size;
+    //If the free pointer is beyond the write pointer, only the space between
+    //them would be available
+    if (rb->write_ptr < rb->free_ptr) {
+        free_size = rb->free_ptr - rb->write_ptr;
+    } else {
+        //Else check which one is bigger amongst the below 2
+        //1) Space from the write pointer to the end of buffer
+        int size1 = rb->data + rb->size - rb->write_ptr;
+        //2) Space from the start of buffer to the free pointer
+        int size2 = rb->free_ptr - rb->data;
+        //And then select the larger of the two
+        free_size = size1 > size2 ? size1 : size2;
+    }
+    //In any case, a single header will be used, so subtracting the space that
+    //would be required for it
+    return free_size - sizeof(buf_entry_hdr_t);
+}
+
 
 RingbufHandle_t xRingbufferCreate(size_t buf_length, ringbuf_type_t type)
 {
@@ -414,6 +503,7 @@ RingbufHandle_t xRingbufferCreate(size_t buf_length, ringbuf_type_t type)
         rb->returnItemToRingbufImpl=returnItemToRingbufDefault;
         //Calculate max item size. Worst case, we need to split an item into two, which means two headers of overhead.
         rb->maxItemSize=rb->size-(sizeof(buf_entry_hdr_t)*2)-4;
+        rb->getFreeSizeImpl=getCurFreeSizeAllowSplit;
     } else if (type==RINGBUF_TYPE_BYTEBUF) {
         rb->flags|=flag_bytebuf;
         rb->copyItemToRingbufImpl=copyItemToRingbufByteBuf;
@@ -421,6 +511,7 @@ RingbufHandle_t xRingbufferCreate(size_t buf_length, ringbuf_type_t type)
         rb->returnItemToRingbufImpl=returnItemToRingbufBytebuf;
         //Calculate max item size. We have no headers and can split anywhere -> size is total size minus one.
         rb->maxItemSize=rb->size-1;
+        rb->getFreeSizeImpl=getCurFreeSizeByteBuf;
     } else if (type==RINGBUF_TYPE_NOSPLIT) {
         rb->copyItemToRingbufImpl=copyItemToRingbufNoSplit;
         rb->getItemFromRingbufImpl=getItemFromRingbufDefault;
@@ -430,6 +521,7 @@ RingbufHandle_t xRingbufferCreate(size_t buf_length, ringbuf_type_t type)
         //(item_data-4) bytes of buffer, then we only have (size-(item_data-4) bytes left to fill
         //with the real item. (item size being header+data)
         rb->maxItemSize=(rb->size/2)-sizeof(buf_entry_hdr_t)-4;
+        rb->getFreeSizeImpl=getCurFreeSizeNoSplit;
     } else {
         configASSERT(0);
     }
@@ -449,6 +541,12 @@ err:
     return NULL;
 }
 
+RingbufHandle_t xRingbufferCreateNoSplit(size_t item_size, size_t num_item)
+{
+    size_t aligned_size = (item_size+3)&~3;
+    return xRingbufferCreate((aligned_size + sizeof(buf_entry_hdr_t)) * num_item, RINGBUF_TYPE_NOSPLIT);
+}
+
 void vRingbufferDelete(RingbufHandle_t ringbuf) {
     ringbuf_t *rb=(ringbuf_t *)ringbuf;
     if (rb) {
@@ -465,6 +563,15 @@ size_t xRingbufferGetMaxItemSize(RingbufHandle_t ringbuf)
     configASSERT(rb);
     return rb->maxItemSize;
 }
+
+bool xRingbufferIsNextItemWrapped(RingbufHandle_t ringbuf)
+{
+    ringbuf_t *rb=(ringbuf_t *)ringbuf;
+    configASSERT(rb);
+    buf_entry_hdr_t *hdr=(buf_entry_hdr_t *)rb->read_ptr;
+    return hdr->flags & iflag_wrap;
+}
+
 
 BaseType_t xRingbufferSend(RingbufHandle_t ringbuf, void *data, size_t dataSize, TickType_t ticks_to_wait)
 {
@@ -496,16 +603,22 @@ BaseType_t xRingbufferSend(RingbufHandle_t ringbuf, void *data, size_t dataSize,
                 //we will need to wait some more.
                 if (ticks_to_wait != portMAX_DELAY) {
                     ticks_remaining = ticks_end - xTaskGetTickCount();
+
+                    // ticks_remaining will always be less than or equal to the original ticks_to_wait,
+                    // unless the timeout is reached - in which case it unsigned underflows to a much
+                    // higher value.
+                    //
+                    // (Check is written this non-intuitive way to allow for the case where xTaskGetTickCount()
+                    // has overflowed but the ticks_end value has not overflowed.)
+                    if(ticks_remaining > ticks_to_wait) {
+                        //Timeout, but there is not enough free space for the item that need to be sent.
+                        xSemaphoreGive(rb->free_space_sem);
+                        return pdFALSE;
+                    }
                 }
 
-                // ticks_remaining will always be less than or equal to the original ticks_to_wait,
-                // unless the timeout is reached - in which case it unsigned underflows to a much
-                // higher value.
-                //
-                // (Check is written this non-intuitive way to allow for the case where xTaskGetTickCount()
-                // has overflowed but the ticks_end value has not overflowed.)
             }
-        } while (ringbufferFreeMem(rb) < needed_size && ticks_remaining > 0 && ticks_remaining <= ticks_to_wait);
+        } while (ringbufferFreeMem(rb) < needed_size);
 
         //Lock the mux in order to make sure no one else is messing with the ringbuffer and do the copy.
         portENTER_CRITICAL(&rb->mux);

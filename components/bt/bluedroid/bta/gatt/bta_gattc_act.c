@@ -34,6 +34,7 @@
 #include "l2c_int.h"
 #include "gatt_int.h"
 #include "allocator.h"
+#include "mutex.h"
 
 #if (defined BTA_HH_LE_INCLUDED && BTA_HH_LE_INCLUDED == TRUE)
 #include "bta_hh_int.h"
@@ -47,6 +48,8 @@
 
 #if GATTC_INCLUDED == TRUE && BLE_INCLUDED == TRUE
 
+static osi_mutex_t write_ccc_mutex;
+
 /*****************************************************************************
 **  Constants
 *****************************************************************************/
@@ -59,6 +62,7 @@ static void  bta_gattc_cmpl_cback(UINT16 conn_id, tGATTC_OPTYPE op, tGATT_STATUS
 static void bta_gattc_cmpl_sendmsg(UINT16 conn_id, tGATTC_OPTYPE op,
                                    tBTA_GATT_STATUS status,
                                    tGATT_CL_COMPLETE *p_data);
+static void bta_gattc_pop_command_to_send(tBTA_GATTC_CLCB *p_clcb);
 
 static void bta_gattc_deregister_cmpl(tBTA_GATTC_RCB *p_clreg);
 static void bta_gattc_enc_cmpl_cback(tGATT_IF gattc_if, BD_ADDR bda);
@@ -124,6 +128,8 @@ static void bta_gattc_enable(tBTA_GATTC_CB *p_cb)
         /* initialize control block */
         memset(&bta_gattc_cb, 0, sizeof(tBTA_GATTC_CB));
         p_cb->state = BTA_GATTC_STATE_ENABLED;
+        // Create a write ccc mutex when the gatt client enable
+        osi_mutex_new(&write_ccc_mutex);
     } else {
         APPL_TRACE_DEBUG("GATTC is arelady enabled");
     }
@@ -150,6 +156,8 @@ void bta_gattc_disable(tBTA_GATTC_CB *p_cb)
         APPL_TRACE_ERROR("not enabled or disable in pogress");
         return;
     }
+    // Free the write ccc mutex when the gatt client disable
+    osi_mutex_free(&write_ccc_mutex);
 
     for (i = 0; i < BTA_GATTC_CL_MAX; i ++) {
         if (p_cb->cl_rcb[i].in_use) {
@@ -916,6 +924,7 @@ void bta_gattc_cfg_mtu(tBTA_GATTC_CLCB *p_clcb, tBTA_GATTC_DATA *p_data)
             /* Dequeue the data, if it was enqueued */
             if (p_clcb->p_q_cmd == p_data) {
                 p_clcb->p_q_cmd = NULL;
+                bta_gattc_pop_command_to_send(p_clcb);
             }
 
             bta_gattc_cmpl_sendmsg(p_clcb->bta_conn_id, GATTC_OPTYPE_CONFIG, status, NULL);
@@ -1012,7 +1021,6 @@ void bta_gattc_disc_cmpl(tBTA_GATTC_CLCB *p_clcb, tBTA_GATTC_DATA *p_data)
     }
     if (p_clcb->p_srcb && p_clcb->p_srcb->p_srvc_list) {
         /* release pending attribute list buffer */
-        APPL_TRACE_DEBUG("+++++++++++++++++++++++++++++++++++++++++++++++++++++++= %p", p_clcb->p_srcb->p_srvc_list);
         osi_free(p_clcb->p_srcb->p_srvc_list);
         p_clcb->p_srcb->p_srvc_list = NULL;
         //osi_free_and_reset((void **)&p_clcb->p_srcb->p_srvc_list);
@@ -1034,11 +1042,9 @@ void bta_gattc_disc_cmpl(tBTA_GATTC_CLCB *p_clcb, tBTA_GATTC_DATA *p_data)
          * referenced by p_clcb->p_q_cmd
          */
         if (p_q_cmd != p_clcb->p_q_cmd) {
-            APPL_TRACE_DEBUG("====================================================================");
             osi_free(p_q_cmd);
             p_q_cmd = NULL;
         }
-            //osi_free_and_reset((void **)&p_q_cmd);
     }
 }
 /*******************************************************************************
@@ -1067,6 +1073,7 @@ void bta_gattc_read(tBTA_GATTC_CLCB *p_clcb, tBTA_GATTC_DATA *p_data)
             /* Dequeue the data, if it was enqueued */
             if (p_clcb->p_q_cmd == p_data) {
                 p_clcb->p_q_cmd = NULL;
+                bta_gattc_pop_command_to_send(p_clcb);
             }
 
             bta_gattc_cmpl_sendmsg(p_clcb->bta_conn_id, GATTC_OPTYPE_READ, status, NULL);
@@ -1102,6 +1109,7 @@ void bta_gattc_read_multi(tBTA_GATTC_CLCB *p_clcb, tBTA_GATTC_DATA *p_data)
             /* Dequeue the data, if it was enqueued */
             if (p_clcb->p_q_cmd == p_data) {
                 p_clcb->p_q_cmd = NULL;
+                bta_gattc_pop_command_to_send(p_clcb);
             }
 
             bta_gattc_cmpl_sendmsg(p_clcb->bta_conn_id, GATTC_OPTYPE_READ, status, NULL);
@@ -1142,6 +1150,7 @@ void bta_gattc_write(tBTA_GATTC_CLCB *p_clcb, tBTA_GATTC_DATA *p_data)
         /* Dequeue the data, if it was enqueued */
         if (p_clcb->p_q_cmd == p_data) {
             p_clcb->p_q_cmd = NULL;
+            bta_gattc_pop_command_to_send(p_clcb);
         }
 
         bta_gattc_cmpl_sendmsg(p_clcb->bta_conn_id, GATTC_OPTYPE_WRITE, status, NULL);
@@ -1166,6 +1175,7 @@ void bta_gattc_execute(tBTA_GATTC_CLCB *p_clcb, tBTA_GATTC_DATA *p_data)
             /* Dequeue the data, if it was enqueued */
             if (p_clcb->p_q_cmd == p_data) {
                 p_clcb->p_q_cmd = NULL;
+                bta_gattc_pop_command_to_send(p_clcb);
             }
 
             bta_gattc_cmpl_sendmsg(p_clcb->bta_conn_id, GATTC_OPTYPE_EXE_WRITE, status, NULL);
@@ -1232,9 +1242,9 @@ void bta_gattc_read_cmpl(tBTA_GATTC_CLCB *p_clcb, tBTA_GATTC_OP_CMPL *p_data)
         event = p_clcb->p_q_cmd->api_read_multi.cmpl_evt;
     }
     cb_data.read.conn_id = p_clcb->bta_conn_id;
-    osi_free(p_clcb->p_q_cmd);
-    p_clcb->p_q_cmd = NULL;
-    //osi_free_and_reset((void **)&p_clcb->p_q_cmd);
+    //free the command data store in the queue.
+    bta_gattc_free_command_data(p_clcb);
+    bta_gattc_pop_command_to_send(p_clcb);
     /* read complete, callback */
     ( *p_clcb->p_rcb->p_cback)(event, (tBTA_GATTC *)&cb_data);
 
@@ -1265,9 +1275,9 @@ void bta_gattc_write_cmpl(tBTA_GATTC_CLCB *p_clcb, tBTA_GATTC_OP_CMPL *p_data)
 		} else {
         event = p_clcb->p_q_cmd->api_write.cmpl_evt;
 	}
-    osi_free(p_clcb->p_q_cmd);
-    p_clcb->p_q_cmd = NULL;
-    //osi_free_and_reset((void **)&p_clcb->p_q_cmd);
+    //free the command data store in the queue.
+    bta_gattc_free_command_data(p_clcb);
+    bta_gattc_pop_command_to_send(p_clcb);
     cb_data.write.conn_id = p_clcb->bta_conn_id;
     /* write complete, callback */
     ( *p_clcb->p_rcb->p_cback)(event, (tBTA_GATTC *)&cb_data);
@@ -1285,9 +1295,9 @@ void bta_gattc_write_cmpl(tBTA_GATTC_CLCB *p_clcb, tBTA_GATTC_OP_CMPL *p_data)
 void bta_gattc_exec_cmpl(tBTA_GATTC_CLCB *p_clcb, tBTA_GATTC_OP_CMPL *p_data)
 {
     tBTA_GATTC          cb_data;
-    osi_free(p_clcb->p_q_cmd);
-    p_clcb->p_q_cmd = NULL;
-    //osi_free_and_reset((void **)&p_clcb->p_q_cmd);
+    //free the command data store in the queue.
+    bta_gattc_free_command_data(p_clcb);
+    bta_gattc_pop_command_to_send(p_clcb);
     p_clcb->status      = BTA_GATT_OK;
 
     /* execute complete, callback */
@@ -1310,10 +1320,9 @@ void bta_gattc_exec_cmpl(tBTA_GATTC_CLCB *p_clcb, tBTA_GATTC_OP_CMPL *p_data)
 void bta_gattc_cfg_mtu_cmpl(tBTA_GATTC_CLCB *p_clcb, tBTA_GATTC_OP_CMPL *p_data)
 {
     tBTA_GATTC          cb_data;
-    osi_free(p_clcb->p_q_cmd);
-    p_clcb->p_q_cmd = NULL;
-    //osi_free_and_reset((void **)&p_clcb->p_q_cmd);
-
+    //free the command data store in the queue.
+    bta_gattc_free_command_data(p_clcb);
+    bta_gattc_pop_command_to_send(p_clcb);
 
     if (p_data->p_cmpl  &&  p_data->status == BTA_GATT_OK) {
         p_clcb->p_srcb->mtu  = p_data->p_cmpl->mtu;
@@ -1456,6 +1465,78 @@ void bta_gattc_q_cmd(tBTA_GATTC_CLCB *p_clcb, tBTA_GATTC_DATA *p_data)
 {
     bta_gattc_enqueue(p_clcb, p_data);
 }
+/*******************************************************************************
+**
+** Function         bta_gattc_pop_command_to_send
+**
+** Description      dequeue a command into control block.
+**                  Check if there has command pending in the command queue or not,
+**                  if there has command pending in the command queue, sent it to the state machine to decision
+**                  should be sent it to the remote device or not.
+**
+** Returns          None.
+**
+*******************************************************************************/
+static void bta_gattc_pop_command_to_send(tBTA_GATTC_CLCB *p_clcb)
+{
+    if (!list_is_empty(p_clcb->p_cmd_list)) {
+        list_node_t *node = list_begin(p_clcb->p_cmd_list);
+        tBTA_GATTC_DATA *p_data = (tBTA_GATTC_DATA *)list_node(node);
+        if (p_data != NULL) {
+            /* execute pending operation of link block still present */
+            if (l2cu_find_lcb_by_bd_addr(p_clcb->p_srcb->server_bda, BT_TRANSPORT_LE) != NULL) {
+                // The data to be sent to the gattc state machine for processing
+                if(bta_gattc_sm_execute(p_clcb, p_data->hdr.event, p_data)) {
+                    list_remove(p_clcb->p_cmd_list, (void *)p_data);
+                }
+
+                if (p_clcb->is_full) {
+                    tBTA_GATTC cb_data = {0};
+                    p_clcb->is_full = FALSE;
+                    cb_data.status = GATT_SUCCESS;
+                    cb_data.queue_full.conn_id = p_clcb->bta_conn_id;
+                    cb_data.queue_full.is_full = FALSE;
+                    if (p_clcb->p_rcb->p_cback != NULL) {
+                        ( *p_clcb->p_rcb->p_cback)(BTA_GATTC_QUEUE_FULL_EVT, (tBTA_GATTC *)&cb_data);
+                    }
+                }
+            }
+        }
+    }
+}
+/*******************************************************************************
+**
+** Function         bta_gattc_free_command_data
+**
+** Description      free the command data into control block.
+**
+** Returns          None.
+**
+*******************************************************************************/
+void bta_gattc_free_command_data(tBTA_GATTC_CLCB *p_clcb)
+{
+    assert(p_clcb->p_cmd_list);
+    //Check the list is empty or not.
+    if (!list_is_empty(p_clcb->p_cmd_list)) {
+        /* Traversal the command queue, check the p_q_cmd is point to the queue data or not, if the p_q_cmd point to the
+           command queue,should remove it from the list */
+        for (list_node_t *node = list_begin(p_clcb->p_cmd_list); node != list_end(p_clcb->p_cmd_list);
+             node = list_next(node)) {
+            tBTA_GATTC_DATA *p_data = (tBTA_GATTC_DATA *)list_node(node);
+            if (p_data == p_clcb->p_q_cmd) {
+                list_remove(p_clcb->p_cmd_list, (void *)p_data);
+                p_clcb->p_q_cmd = NULL;
+                return;
+            }
+        }
+
+        osi_free(p_clcb->p_q_cmd);
+        p_clcb->p_q_cmd = NULL;
+    } else {
+        osi_free(p_clcb->p_q_cmd);
+        p_clcb->p_q_cmd = NULL;
+    }
+}
 
 /*******************************************************************************
 **
@@ -1563,9 +1644,16 @@ static void bta_gattc_conn_cback(tGATT_IF gattc_if, BD_ADDR bda, UINT16 conn_id,
     else if ((transport == BT_TRANSPORT_LE) && (connected == FALSE) && (p_conn != NULL)){
             p_conn->service_change_ccc_written = FALSE;
             if (p_conn->ccc_timer_used == TRUE){
-                osi_free((void *)p_conn->service_change_ccc_timer.param);
+                assert(write_ccc_mutex != NULL);
+                osi_mutex_lock(&write_ccc_mutex, OSI_MUTEX_MAX_TIMEOUT);
+
+                if (p_conn->service_change_ccc_timer.param != 0) {
+                    osi_free((void *)p_conn->service_change_ccc_timer.param);
+                    p_conn->service_change_ccc_timer.param = (TIMER_PARAM_TYPE)0;
+                }
                 bta_sys_stop_timer(&(p_conn->service_change_ccc_timer));
                 p_conn->ccc_timer_used = FALSE;
+                osi_mutex_unlock(&write_ccc_mutex);
             }
     }
 
@@ -2084,8 +2172,8 @@ void bta_gattc_broadcast(tBTA_GATTC_CB *p_cb, tBTA_GATTC_DATA *p_msg)
     UNUSED(p_cb);
 
     cb_data.reg_oper.client_if = p_msg->api_listen.client_if;
-    cb_data.reg_oper.status = BTM_BleBroadcast(p_msg->api_listen.start);
-
+    cb_data.reg_oper.status = BTM_BleBroadcast(p_msg->api_listen.start, NULL);
+    //TODO need modify callback if used
     if (p_clreg && p_clreg->p_cback) {
         (*p_clreg->p_cback)(BTA_GATTC_LISTEN_EVT, &cb_data);
     }
@@ -2266,9 +2354,14 @@ static void bta_gattc_wait4_service_change_ccc_cback (TIMER_LIST_ENT *p_tle)
     BOOLEAN start_ccc_timer = FALSE;
     UINT32 new_timeout;
 
+    assert(write_ccc_mutex != NULL);
+    osi_mutex_lock(&write_ccc_mutex, OSI_MUTEX_MAX_TIMEOUT);
+
     tBTA_GATTC_WAIT_CCC_TIMER *p_timer_param = (tBTA_GATTC_WAIT_CCC_TIMER*) p_tle->param;
+    p_tle->param = (TIMER_PARAM_TYPE)0;
     if (p_timer_param == NULL){
         APPL_TRACE_ERROR("p_timer_param is NULL in %s\n", __func__);
+        osi_mutex_unlock(&write_ccc_mutex);
         return;
     }
 
@@ -2276,6 +2369,7 @@ static void bta_gattc_wait4_service_change_ccc_cback (TIMER_LIST_ENT *p_tle)
     if (p_conn == NULL){
         APPL_TRACE_ERROR("p_conn is NULL in %s\n", __func__);
         osi_free(p_timer_param);
+        osi_mutex_unlock(&write_ccc_mutex);
         return;
     }
 
@@ -2307,6 +2401,7 @@ static void bta_gattc_wait4_service_change_ccc_cback (TIMER_LIST_ENT *p_tle)
     }
 
     osi_free(p_timer_param);
+    osi_mutex_unlock(&write_ccc_mutex);
 }
 
 #endif
