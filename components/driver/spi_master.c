@@ -233,7 +233,7 @@ esp_err_t spi_bus_free(spi_host_device_t host)
  Add a device. This allocates a CS line for the device, allocates memory for the device structure and hooks
  up the CS pin to whatever is specified.
 */
-esp_err_t spi_bus_add_device(spi_host_device_t host, spi_device_interface_config_t *dev_config, spi_device_handle_t *handle)
+esp_err_t spi_bus_add_device(spi_host_device_t host, const spi_device_interface_config_t *dev_config, spi_device_handle_t *handle)
 {
     int freecs;
     int apbclk=APB_CLK_FREQ;
@@ -263,11 +263,11 @@ esp_err_t spi_bus_add_device(spi_host_device_t host, spi_device_interface_config
     dev->trans_queue=xQueueCreate(dev_config->queue_size, sizeof(spi_trans_priv));
     dev->ret_queue=xQueueCreate(dev_config->queue_size, sizeof(spi_trans_priv));
     if (!dev->trans_queue || !dev->ret_queue) goto nomem;
-    if (dev_config->duty_cycle_pos==0) dev_config->duty_cycle_pos=128;
     dev->host=spihost[host];
 
     //We want to save a copy of the dev config in the dev struct.
     memcpy(&dev->cfg, dev_config, sizeof(spi_device_interface_config_t));
+    if (dev->cfg.duty_cycle_pos==0) dev->cfg.duty_cycle_pos=128;
 
     //Set CS pin, CS options
     if (dev_config->spics_io_num >= 0) {
