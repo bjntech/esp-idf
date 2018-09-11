@@ -31,3 +31,5 @@ nconf.exe
 qconf.exe
 gconf.exe
 kxgettext.exe
+conf-idf.exe
+mconf-idf.exe
